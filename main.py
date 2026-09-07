@@ -8,6 +8,7 @@ import ipaddress
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -18,8 +19,88 @@ from tkinter import ttk, messagebox, filedialog
 
 
 APP_NAME = "RADAR"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_FULL_NAME = "Rapid Address Discovery And Response"
+
+# Number of sweep passes. A host that replies on any pass is kept;
+# a host that misses is retried on the next pass; a host that misses
+# every pass is treated as down.
+SWEEP_PASSES = 3
+
+# 16-byte echo payload, matching the default Windows "ping".
+_ICMP_PAYLOAD = b"radar-icmp-probe"
+
+# IP_SUCCESS from the Windows ICMP API: the destination itself
+# returned an echo reply.
+_IP_SUCCESS = 0
+
+
+class _IpOptionInformation(ctypes.Structure):
+    _fields_ = [
+        ("Ttl", ctypes.c_ubyte),
+        ("Tos", ctypes.c_ubyte),
+        ("Flags", ctypes.c_ubyte),
+        ("OptionsSize", ctypes.c_ubyte),
+        ("OptionsData", ctypes.c_void_p),
+    ]
+
+
+class _IcmpEchoReply(ctypes.Structure):
+    _fields_ = [
+        ("Address", ctypes.c_uint32),
+        ("Status", ctypes.c_uint32),
+        ("RoundTripTime", ctypes.c_uint32),
+        ("DataSize", ctypes.c_uint16),
+        ("Reserved", ctypes.c_uint16),
+        ("Data", ctypes.c_void_p),
+        ("Options", _IpOptionInformation),
+    ]
+
+
+def _load_icmp_api():
+    """Bind iphlpapi.dll's ICMP Echo functions, or return None
+    when not on Windows."""
+
+    if platform.system().lower() != "windows":
+        return None
+
+    iphlpapi = ctypes.WinDLL("iphlpapi.dll")
+
+    create = iphlpapi.IcmpCreateFile
+    create.restype = ctypes.c_void_p
+    create.argtypes = []
+
+    close = iphlpapi.IcmpCloseHandle
+    close.restype = ctypes.c_bool
+    close.argtypes = [ctypes.c_void_p]
+
+    send = iphlpapi.IcmpSendEcho
+    send.restype = ctypes.c_ulong
+    send.argtypes = [
+        ctypes.c_void_p,   # IcmpHandle
+        ctypes.c_uint32,   # DestinationAddress (IPAddr, network order)
+        ctypes.c_char_p,   # RequestData
+        ctypes.c_uint16,   # RequestSize
+        ctypes.c_void_p,   # RequestOptions (NULL)
+        ctypes.c_void_p,   # ReplyBuffer
+        ctypes.c_ulong,    # ReplySize
+        ctypes.c_ulong,    # Timeout (ms)
+    ]
+
+    return {
+        "create": create,
+        "close": close,
+        "send": send,
+        "invalid_handle": ctypes.c_void_p(-1).value,
+        "reply_size": (
+            ctypes.sizeof(_IcmpEchoReply)
+            + len(_ICMP_PAYLOAD)
+            + 8
+        ),
+    }
+
+
+_ICMP_API = _load_icmp_api()
 
 
 class RadarApp:
@@ -55,6 +136,7 @@ class RadarApp:
         self.stop_event = threading.Event()
         self.scan_thread = None
         self.alive_hosts = []
+        self.scan_host_total = 0
 
         self.configure_styles()
         self.build_gui()
@@ -1467,7 +1549,9 @@ class RadarApp:
             hosts
         )
 
-        self.progress["maximum"] = total
+        self.scan_host_total = total
+
+        self.progress["maximum"] = total * SWEEP_PASSES
         self.progress["value"] = 0
 
         self.percent_var.set(
@@ -1475,7 +1559,7 @@ class RadarApp:
         )
 
         self.scan_count_var.set(
-            f"0 / {total:,} scanned"
+            f"pass 1/{SWEEP_PASSES}  |  0 / {total:,}"
         )
 
         self.progress_hosts_var.set(
@@ -1491,7 +1575,8 @@ class RadarApp:
             args=(
                 hosts,
                 workers,
-                timeout
+                timeout,
+                network
             ),
             daemon=True
         )
@@ -1505,76 +1590,117 @@ class RadarApp:
         self,
         hosts,
         workers,
-        timeout
+        timeout,
+        network
     ):
         start_time = time.perf_counter()
 
-        completed = 0
+        pass_count = SWEEP_PASSES
+        total_units = len(hosts) * pass_count
+        credited_units = 0
 
-        executor = (
-            concurrent.futures
-            .ThreadPoolExecutor(
-                max_workers=workers
+        # Hosts still waiting for a good reply. A host is dropped
+        # from this list the moment any pass confirms it, so only
+        # the survivors are re-probed on the following pass.
+        pending = list(hosts)
+
+        for pass_index in range(pass_count):
+            if self.stop_event.is_set() or not pending:
+                break
+
+            pass_num = pass_index + 1
+            passes_left = pass_count - pass_num
+            pass_total = len(pending)
+            done_in_pass = 0
+
+            self.root.after(
+                0,
+                self.set_pass_status,
+                network,
+                pass_num,
+                pass_count,
+                pass_total
             )
-        )
 
-        try:
-            futures = {
-                executor.submit(
-                    self.ping_host,
-                    ip,
-                    timeout
-                ): ip
-                for ip in hosts
-            }
+            next_pending = []
 
-            for future in (
+            executor = (
                 concurrent.futures
-                .as_completed(futures)
-            ):
-                if self.stop_event.is_set():
-                    break
+                .ThreadPoolExecutor(
+                    max_workers=workers
+                )
+            )
 
-                completed += 1
+            try:
+                futures = {
+                    executor.submit(
+                        self.ping_host,
+                        ip,
+                        timeout
+                    ): ip
+                    for ip in pending
+                }
 
-                try:
-                    result = future.result()
+                for future in (
+                    concurrent.futures
+                    .as_completed(futures)
+                ):
+                    if self.stop_event.is_set():
+                        break
 
-                except Exception:
-                    result = None
+                    ip = futures[future]
 
-                if result:
-                    ip_obj = ipaddress.ip_address(
-                        result
-                    )
+                    try:
+                        result = future.result()
 
-                    self.alive_hosts.append(
-                        ip_obj
-                    )
+                    except Exception:
+                        result = None
+
+                    credited_units += 1
+                    done_in_pass += 1
+
+                    if result:
+                        # Confirmed on this pass, so it is not
+                        # re-probed. Credit the passes it skips now
+                        # to keep the progress bar honest.
+                        credited_units += passes_left
+
+                        self.alive_hosts.append(
+                            ipaddress.ip_address(result)
+                        )
+
+                        self.root.after(
+                            0,
+                            self.refresh_results
+                        )
+
+                    else:
+                        next_pending.append(ip)
 
                     self.root.after(
                         0,
-                        self.refresh_results
+                        self.update_progress,
+                        credited_units,
+                        total_units,
+                        done_in_pass,
+                        pass_total,
+                        pass_num,
+                        pass_count
                     )
 
-                self.root.after(
-                    0,
-                    self.update_progress,
-                    completed,
-                    len(hosts)
-                )
+            finally:
+                if self.stop_event.is_set():
+                    executor.shutdown(
+                        wait=False,
+                        cancel_futures=True
+                    )
 
-        finally:
-            if self.stop_event.is_set():
-                executor.shutdown(
-                    wait=False,
-                    cancel_futures=True
-                )
+                else:
+                    executor.shutdown(
+                        wait=True
+                    )
 
-            else:
-                executor.shutdown(
-                    wait=True
-                )
+            pending = next_pending
 
         elapsed = (
             time.perf_counter()
@@ -1598,63 +1724,111 @@ class RadarApp:
         if self.stop_event.is_set():
             return None
 
-        system = platform.system().lower()
+        if _ICMP_API is not None:
+            return self.icmp_echo(ip, timeout)
 
-        if system == "windows":
-            command = [
-                "ping",
-                "-n",
-                "1",
-                "-w",
-                str(
-                    int(timeout * 1000)
-                ),
-                str(ip)
-            ]
+        return self.subprocess_ping(ip, timeout)
 
-        else:
-            command = [
-                "ping",
-                "-c",
-                "1",
-                "-W",
-                str(
-                    max(
-                        1,
-                        int(timeout)
-                    )
-                ),
-                str(ip)
-            ]
+    # -----------------------------------------------------
+    # Windows ICMP Echo (no child process)
+    # -----------------------------------------------------
+    def icmp_echo(
+        self,
+        ip,
+        timeout
+    ):
+        handle = _ICMP_API["create"]()
 
-        startupinfo = None
+        if (
+            not handle
+            or handle == _ICMP_API["invalid_handle"]
+        ):
+            return None
 
-        if system == "windows":
-            startupinfo = (
-                subprocess.STARTUPINFO()
+        try:
+            destination = int.from_bytes(
+                socket.inet_aton(str(ip)),
+                "little"
             )
 
-            startupinfo.dwFlags |= (
-                subprocess.STARTF_USESHOWWINDOW
+            reply_size = _ICMP_API["reply_size"]
+            reply_buffer = ctypes.create_string_buffer(
+                reply_size
             )
+
+            replies = _ICMP_API["send"](
+                handle,
+                destination,
+                _ICMP_PAYLOAD,
+                len(_ICMP_PAYLOAD),
+                None,
+                reply_buffer,
+                reply_size,
+                max(1, int(timeout * 1000))
+            )
+
+            if not replies:
+                return None
+
+            reply = ctypes.cast(
+                reply_buffer,
+                ctypes.POINTER(_IcmpEchoReply)
+            ).contents
+
+            # A nonzero return can still be a router's "unreachable"
+            # reply, so only IP_SUCCESS means the host answered.
+            if reply.Status == _IP_SUCCESS:
+                return str(ip)
+
+            return None
+
+        except OSError:
+            return None
+
+        finally:
+            _ICMP_API["close"](handle)
+
+    # -----------------------------------------------------
+    # POSIX fallback (Linux / macOS)
+    # -----------------------------------------------------
+    def subprocess_ping(
+        self,
+        ip,
+        timeout
+    ):
+        command = [
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            str(
+                max(
+                    1,
+                    int(timeout)
+                )
+            ),
+            str(ip)
+        ]
 
         try:
             result = subprocess.run(
                 command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=timeout + 1,
-                startupinfo=startupinfo
+                capture_output=True,
+                text=True,
+                timeout=timeout * 2 + 2
             )
-
-            if result.returncode == 0:
-                return str(ip)
 
         except (
             subprocess.TimeoutExpired,
             OSError
         ):
-            pass
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        if "ttl=" in (result.stdout or "").lower():
+            return str(ip)
 
         return None
 
@@ -1663,14 +1837,18 @@ class RadarApp:
     # =====================================================
     def update_progress(
         self,
-        completed,
-        total
+        credited,
+        total_units,
+        done_in_pass,
+        pass_total,
+        pass_num,
+        pass_count
     ):
-        self.progress["value"] = completed
+        self.progress["value"] = credited
 
         percentage = (
-            (completed / total) * 100
-            if total
+            (credited / total_units) * 100
+            if total_units
             else 0
         )
 
@@ -1683,7 +1861,8 @@ class RadarApp:
         )
 
         self.scan_count_var.set(
-            f"{completed:,} / {total:,} scanned"
+            f"pass {pass_num}/{pass_count}"
+            f"  |  {done_in_pass:,} / {pass_total:,}"
         )
 
         host_word = (
@@ -1695,6 +1874,26 @@ class RadarApp:
         self.progress_hosts_var.set(
             f"{found} {host_word} discovered"
         )
+
+    def set_pass_status(
+        self,
+        network,
+        pass_num,
+        pass_count,
+        remaining
+    ):
+        if pass_num == 1:
+            self.status_var.set(
+                f"RADAR sweep  |  pass {pass_num}/{pass_count}"
+                f"  |  {remaining:,} hosts  |  {network}"
+            )
+
+        else:
+            self.status_var.set(
+                f"RADAR sweep  |  pass {pass_num}/{pass_count}"
+                f"  |  re-checking {remaining:,} unconfirmed"
+                f"  |  {network}"
+            )
 
     # =====================================================
     # Results
@@ -1901,12 +2100,11 @@ class RadarApp:
                 "100%"
             )
 
-            total = int(
-                self.progress["maximum"]
-            )
+            total = self.scan_host_total
 
             self.scan_count_var.set(
                 f"{total:,} / {total:,} scanned"
+                f"  |  {SWEEP_PASSES} passes"
             )
 
             self.status_var.set(
